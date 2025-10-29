@@ -14,25 +14,24 @@ jobs:
         with:
           persist-credentials: true
           fetch-depth: 0
-          lfs: true  # ✅ Enable Git LFS for large VM files
+          lfs: true
 
       - name: Prepare vm_data folder
         run: |
           echo "📁 Preparing vm_data folder..."
           mkdir -p "$GITHUB_WORKSPACE/vm_data"
-          cd "$GITHUB_WORKSPACE/vm_data"
           echo "✅ vm_data folder ready."
 
-      - name: Restore previous VM data (includes .qcow2/.raw/.iso/.qwoc)
+      - name: Restore previous VM data (includes .qcow2/.raw/.iso/.img/.vmdk/.qwoc)
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           echo "🔁 Restoring VM data from vm-data branch..."
           cd "$GITHUB_WORKSPACE/vm_data"
           rm -rf ./*
-          git clone --branch vm-data https://$PAT_TOKEN@github.com/${{ github.repository }} . \
+          git clone --quiet --branch vm-data "https://$PAT_TOKEN@github.com/${{ github.repository }}" . \
             || echo "⚠️ vm-data branch not found — starting fresh."
-          echo "✅ Data restored (includes all VM disks and ISOs)."
+          echo "✅ Data restored (includes QEMU disks and ISOs)."
           ls -lh || true
 
       - name: Start SSHX (for remote access)
@@ -45,55 +44,59 @@ jobs:
           grep -Eo 'https://sshx.io/[^ ]+' sshx_link.txt || echo "❌ SSHX link not found"
           echo "✅ SSHX running."
 
-      - name: Start Heartbeat & Autosave (with Recursive Git LFS)
+      - name: Start Heartbeat & Autosave (Recursive LFS Scan)
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          echo "💾 Starting autosave (10s interval, recursive file scan)..."
+          echo "💾 Starting autosave (10s interval, recursive scan)..."
           cd "$GITHUB_WORKSPACE/vm_data"
 
-          # 🧩 Install and configure Git LFS
+          # Install Git LFS
           sudo apt-get update -qq
           sudo apt-get install -y git-lfs
           git lfs install --skip-repo
 
-          # 🔍 Track VM binary formats globally
-          git lfs track "*.qcow2" "*.raw" "*.iso" "*.img" "*.vmdk" "*.qwoc"
-          cat <<EOF > .gitattributes
-*.qcow2 filter=lfs diff=lfs merge=lfs -text
-*.raw   filter=lfs diff=lfs merge=lfs -text
-*.iso   filter=lfs diff=lfs merge=lfs -text
-*.img   filter=lfs diff=lfs merge=lfs -text
-*.vmdk  filter=lfs diff=lfs merge=lfs -text
-*.qwoc  filter=lfs diff=lfs merge=lfs -text
-EOF
+          # Configure .gitattributes safely (no heredoc)
+          {
+            echo "*.qcow2 filter=lfs diff=lfs merge=lfs -text"
+            echo "*.raw filter=lfs diff=lfs merge=lfs -text"
+            echo "*.iso filter=lfs diff=lfs merge=lfs -text"
+            echo "*.img filter=lfs diff=lfs merge=lfs -text"
+            echo "*.vmdk filter=lfs diff=lfs merge=lfs -text"
+            echo "*.qwoc filter=lfs diff=lfs merge=lfs -text"
+          } > .gitattributes
 
-          # 🌀 Start infinite autosave loop
-          nohup bash -c "while true; do
-            echo \"🔍 Scanning for VM image files...\"
-            find . -type f \( -iname '*.qcow2' -o -iname '*.raw' -o -iname '*.iso' -o -iname '*.img' -o -iname '*.vmdk' -o -iname '*.qwoc' \) -print || true
+          git add .gitattributes
+          git commit -m "Enable Git LFS for VM files" -q || true
+          git push -f "https://$PAT_TOKEN@github.com/${{ github.repository }}" HEAD:vm-data || true
 
-            git init -q
-            git config user.email 'actions@github.com'
-            git config user.name 'github-actions'
-            git add .gitattributes
-            git add --all
-            git commit -m \"🕐 Autosave at \$(date '+%H:%M:%S')\" -q || true
-            git branch -M vm-data
-            git push -f https://$PAT_TOKEN@github.com/${{ github.repository }} vm-data >/dev/null 2>&1 || true
+          # Start autosave loop
+          SLEEP_SECONDS=10
+          nohup bash -c "
+            while true; do
+              echo '🔍 Scanning for VM image files...'
+              find . -type f \( -iname '*.qcow2' -o -iname '*.raw' -o -iname '*.iso' -o -iname '*.img' -o -iname '*.vmdk' -o -iname '*.qwoc' \) -print || true
 
-            echo \"[\$(date '+%H:%M:%S')] ✅ Autosave complete.\" >> status.log
-            sleep 10
-          done" &
+              git init -q || true
+              git config user.email 'actions@github.com'
+              git config user.name 'github-actions'
+              git add --all || true
+              git commit -m '🕐 Autosave at $(date "+%Y-%m-%d %H:%M:%S")' -q || true
+              git branch -M vm-data || true
+              git push -f 'https://$PAT_TOKEN@github.com/${{ github.repository }}' vm-data >/dev/null 2>&1 || true
 
-          echo "✅ Autosave running (includes all VM images recursively)."
+              echo '[✅] Autosave complete at $(date "+%H:%M:%S")'
+              sleep $SLEEP_SECONDS
+            done
+          " &
+          echo "✅ Autosave loop started (interval: ${SLEEP_SECONDS}s)."
 
       - name: Keep VPS alive
         run: |
           echo "⏳ VPS running for 5 hours 30 minutes..."
           sleep 19800
 
-      - name: Final Save + Auto Restart (recursive LFS backup)
+      - name: Final Save + Auto Restart (LFS recursive backup)
         if: always()
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
@@ -107,36 +110,25 @@ EOF
           sudo apt-get install -y git-lfs
           git lfs install --skip-repo
 
-          # Re-track file types to ensure consistency
-          git lfs track "*.qcow2" "*.raw" "*.iso" "*.img" "*.vmdk" "*.qwoc"
-          cat <<EOF > .gitattributes
-*.qcow2 filter=lfs diff=lfs merge=lfs -text
-*.raw   filter=lfs diff=lfs merge=lfs -text
-*.iso   filter=lfs diff=lfs merge=lfs -text
-*.img   filter=lfs diff=lfs merge=lfs -text
-*.vmdk  filter=lfs diff=lfs merge=lfs -text
-*.qwoc  filter=lfs diff=lfs merge=lfs -text
-EOF
+          {
+            echo "*.qcow2 filter=lfs diff=lfs merge=lfs -text"
+            echo "*.raw filter=lfs diff=lfs merge=lfs -text"
+            echo "*.iso filter=lfs diff=lfs merge=lfs -text"
+            echo "*.img filter=lfs diff=lfs merge=lfs -text"
+            echo "*.vmdk filter=lfs diff=lfs merge=lfs -text"
+            echo "*.qwoc filter=lfs diff=lfs merge=lfs -text"
+          } > .gitattributes
 
-          echo "🔍 Checking vm_data recursively for image files..."
-          find . -type f \( -iname '*.qcow2' -o -iname '*.raw' -o -iname '*.iso' -o -iname '*.img' -o -iname '*.vmdk' -o -iname '*.qwoc' \) -print || true
-
-          git init -q
-          git config user.email 'actions@github.com'
-          git config user.name 'github-actions'
-          git add .gitattributes
-          git add --all
-          git commit -m \"💾 Final autosave before restart \$(date '+%H:%M:%S')\" -q || true
-          git branch -M vm-data
-          git push -f https://$PAT_TOKEN@github.com/${{ github.repository }} vm-data || true
+          git add --all || true
+          git commit -m "💾 Final autosave before restart $(date '+%Y-%m-%d %H:%M:%S')" -q || true
+          git branch -M vm-data || true
+          git push -f "https://$PAT_TOKEN@github.com/${{ github.repository }}" vm-data || true
           echo "✅ Final data saved (includes all VM images)."
 
-          echo "[$(date '+%H:%M:%S')] 🔁 Restart triggered" >> status.log
-
           echo "♻️ Triggering automatic restart..."
-          curl -X POST \
+          curl -s -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $PAT_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WORKFLOW_FILE/dispatches" \
-            -d "{\"ref\":\"$RESTART_REF\"}"
+            -d "{\"ref\":\"$RESTART_REF\"}" >/dev/null 2>&1 || true
           echo "✅ Restart request sent!"
