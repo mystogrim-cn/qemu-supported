@@ -1,0 +1,131 @@
+name: Persistent Ubuntu VPS (5h30 Auto-Restart)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 335  # 5h30m + buffer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+          lfs: true  # ✅ enable LFS fetching
+
+      - name: Prepare vm_data folder
+        run: |
+          echo "📁 Preparing vm_data folder..."
+          mkdir -p "$GITHUB_WORKSPACE/vm_data"
+          cd "$GITHUB_WORKSPACE/vm_data"
+          echo "✅ vm_data folder ready."
+
+      - name: Restore previous VM data (includes .qwoc/.iso/.img/.qcow2)
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          echo "🔁 Restoring VM data from vm-data branch..."
+          cd "$GITHUB_WORKSPACE/vm_data"
+          rm -rf ./*
+          git clone --branch vm-data https://$PAT_TOKEN@github.com/${{ github.repository }} . \
+            || echo "⚠️ vm-data branch not found — starting fresh."
+
+          echo "✅ Data restored (includes VM files)."
+          ls -lh || true
+
+      - name: Start SSHX (for access)
+        run: |
+          echo "⚙️ Starting SSHX..."
+          cd "$GITHUB_WORKSPACE/vm_data"
+          nohup bash -c "curl -sSf https://sshx.io/get | sh -s run > sshx_link.txt 2>&1" &
+          sleep 8
+          echo "🌐 SSHX Link:"
+          grep -Eo 'https://sshx.io/[^ ]+' sshx_link.txt || echo "❌ SSHX link not found"
+          echo "✅ SSHX running."
+
+      - name: Start Heartbeat & Autosave (with LFS)
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          echo "💾 Starting 10-sec autosave with Git LFS..."
+          cd "$GITHUB_WORKSPACE/vm_data"
+
+          # Install Git LFS inside the runner
+          sudo apt-get update -qq
+          sudo apt-get install -y git-lfs
+          git lfs install --skip-repo
+
+          # Track all VM-related binary formats
+          git lfs track "*.qwoc" "*.iso" "*.img" "*.qcow2"
+          echo "*.qwoc filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+          echo "*.iso  filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+          echo "*.img  filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+          echo "*.qcow2 filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+
+          nohup bash -c "while true; do
+            find . -type d -empty -exec touch {}/.gitkeep \;
+
+            git init -q
+            git lfs install --skip-repo
+            git config user.email 'actions@github.com'
+            git config user.name 'github-actions'
+            git add --all
+            git commit -m \"🕐 Autosave at \$(date '+%H:%M:%S')\" -q || true
+            git branch -M vm-data
+            git push -f https://$PAT_TOKEN@github.com/${{ github.repository }} vm-data >/dev/null 2>&1 || true
+
+            echo \"[\$(date '+%H:%M:%S')] ✅ Alive (autosave running)\" >> status.log
+            sleep 10
+          done" &
+
+          echo "✅ Autosave running (Git LFS active, includes .qwoc, .iso, .img, .qcow2)."
+
+      - name: Keep VPS alive
+        run: |
+          echo "⏳ VPS running for 5 h 30 min..."
+          sleep 19800
+
+      - name: Final Save + Auto Restart (with LFS)
+        if: always()
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          WORKFLOW_FILE: main.yml
+          RESTART_REF: main
+        run: |
+          echo "📦 Runner shutting down — saving final data..."
+          cd "$GITHUB_WORKSPACE/vm_data"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y git-lfs
+          git lfs install --skip-repo
+
+          # Track again (for safety)
+          git lfs track "*.qwoc" "*.iso" "*.img" "*.qcow2"
+          echo "*.qwoc filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+          echo "*.iso  filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+          echo "*.img  filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+          echo "*.qcow2 filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+
+          find . -type d -empty -exec touch {}/.gitkeep \;
+
+          git init -q
+          git config user.email 'actions@github.com'
+          git config user.name 'github-actions'
+          git add --all
+          git commit -m "💾 Final autosave before restart $(date '+%H:%M:%S')" -q || true
+          git branch -M vm-data
+          git push -f https://$PAT_TOKEN@github.com/${{ github.repository }} vm-data || true
+          echo "✅ Final data saved (all VM files included)."
+
+          echo "[$(date '+%H:%M:%S')] 🔁 Restart triggered" >> status.log
+
+          echo "♻️ Triggering automatic restart..."
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $PAT_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$WORKFLOW_FILE/dispatches" \
+            -d "{\"ref\":\"$RESTART_REF\"}"
+          echo "✅ Restart request sent!"
